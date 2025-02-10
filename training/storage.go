@@ -2,6 +2,9 @@ package training
 
 import (
 	"fmt"
+	"github.com/singnet/snet-daemon/v5/blockchain"
+	"github.com/singnet/snet-daemon/v5/config"
+	"go.uber.org/zap"
 	"reflect"
 
 	"github.com/singnet/snet-daemon/v5/storage"
@@ -9,7 +12,8 @@ import (
 )
 
 type ModelStorage struct {
-	delegate storage.TypedAtomicStorage
+	delegate             storage.TypedAtomicStorage
+	organizationMetaData *blockchain.OrganizationMetaData
 }
 
 type ModelUserStorage struct {
@@ -17,7 +21,8 @@ type ModelUserStorage struct {
 }
 
 type PendingModelStorage struct {
-	delegate storage.TypedAtomicStorage
+	delegate             storage.TypedAtomicStorage
+	organizationMetaData *blockchain.OrganizationMetaData
 }
 
 type PublicModelStorage struct {
@@ -33,22 +38,22 @@ func NewUserModelStorage(atomicStorage storage.AtomicStorage) *ModelUserStorage 
 	return &ModelUserStorage{delegate: userModelStorage}
 }
 
-func NewModelStorage(atomicStorage storage.AtomicStorage) *ModelStorage {
+func NewModelStorage(atomicStorage storage.AtomicStorage, orgMetadata *blockchain.OrganizationMetaData) *ModelStorage {
 	prefixedStorage := storage.NewPrefixedAtomicStorage(atomicStorage, "/model-user/modelStorage")
 	modelStorage := storage.NewTypedAtomicStorageImpl(
 		prefixedStorage, serializeModelKey, reflect.TypeOf(ModelKey{}), utils.Serialize, utils.Deserialize,
 		reflect.TypeOf(ModelData{}),
 	)
-	return &ModelStorage{delegate: modelStorage}
+	return &ModelStorage{delegate: modelStorage, organizationMetaData: orgMetadata}
 }
 
-func NewPendingModelStorage(atomicStorage storage.AtomicStorage) *PendingModelStorage {
+func NewPendingModelStorage(atomicStorage storage.AtomicStorage, orgMetadata *blockchain.OrganizationMetaData) *PendingModelStorage {
 	prefixedStorage := storage.NewPrefixedAtomicStorage(atomicStorage, "/model-user/pendingModelStorage")
 	pendingModelStorage := storage.NewTypedAtomicStorageImpl(
 		prefixedStorage, serializePendingModelKey, reflect.TypeOf(PendingModelKey{}), utils.Serialize, utils.Deserialize,
 		reflect.TypeOf(PendingModelData{}),
 	)
-	return &PendingModelStorage{delegate: pendingModelStorage}
+	return &PendingModelStorage{delegate: pendingModelStorage, organizationMetaData: orgMetadata}
 }
 
 func NewPublicModelStorage(atomicStorage storage.AtomicStorage) *PublicModelStorage {
@@ -81,7 +86,7 @@ type ModelData struct {
 	Status              Status
 	CreatedByAddress    string
 	ModelId             string
-	UpdatedByAddress    string
+	UpdatedByAddress    string // TODO ?!
 	GroupId             string
 	OrganizationId      string
 	ServiceId           string
@@ -90,7 +95,10 @@ type ModelData struct {
 	Description         string
 	IsDefault           bool
 	TrainingLink        string
+	ValidatePrice       uint64
+	TrainPrice          uint64
 	UpdatedDate         string
+	CreatedDate         string
 }
 
 func (data *ModelData) String() string {
@@ -104,9 +112,7 @@ type ModelUserKey struct {
 	OrganizationId string
 	ServiceId      string
 	GroupId        string
-	//GRPCMethodName  string
-	//GRPCServiceName string
-	UserAddress string
+	UserAddress    string
 }
 
 func (key *ModelUserKey) String() string {
@@ -204,6 +210,25 @@ func (storage *ModelStorage) CompareAndSwap(key *ModelKey, prevState *ModelData,
 	return storage.delegate.CompareAndSwap(key, prevState, newState)
 }
 
+func (storage *ModelStorage) buildModelKey(modelID string) (key *ModelKey) {
+	key = &ModelKey{
+		OrganizationId: config.GetString(config.OrganizationId),
+		ServiceId:      config.GetString(config.ServiceId),
+		GroupId:        storage.organizationMetaData.GetGroupIdString(),
+		ModelId:        modelID,
+	}
+	return
+}
+
+func (storage *ModelStorage) GetModel(modelID string) (data *ModelData, err error) {
+	key := storage.buildModelKey(modelID)
+	ok := false
+	if data, ok, err = storage.Get(key); err != nil || !ok {
+		zap.L().Warn("unable to retrieve model data from storage", zap.String("Model Id", key.ModelId), zap.Error(err))
+	}
+	return
+}
+
 func serializeModelUserKey(key any) (serialized string, err error) {
 	modelUserKey := key.(*ModelUserKey)
 	return modelUserKey.String(), nil
@@ -266,7 +291,16 @@ func (storage *PendingModelStorage) Put(key *PendingModelKey, state *PendingMode
 	return storage.delegate.Put(key, state)
 }
 
+func (storage *PendingModelStorage) buildPendingModelKey() *PendingModelKey {
+	return &PendingModelKey{
+		OrganizationId: config.GetString(config.OrganizationId),
+		ServiceId:      config.GetString(config.ServiceId),
+		GroupId:        storage.organizationMetaData.GetGroupIdString(),
+	}
+}
+
 func (pendingStorage *PendingModelStorage) AddPendingModelId(key *PendingModelKey, modelId string) (err error) {
+
 	typedUpdateFunc := func(conditionValues []storage.TypedKeyValueData) (update []storage.TypedKeyValueData, ok bool, err error) {
 		if len(conditionValues) != 1 || conditionValues[0].Key != key {
 			return nil, false, fmt.Errorf("unexpected condition values or missing key")
@@ -293,8 +327,68 @@ func (pendingStorage *PendingModelStorage) AddPendingModelId(key *PendingModelKe
 			}
 		}
 
+		zap.L().Debug("[AddPendingModelId]", zap.Strings("modelIDS", pendingModelData.ModelIDs))
+
 		// Add the new model ID to the list
 		pendingModelData.ModelIDs = append(pendingModelData.ModelIDs, modelId)
+
+		zap.L().Debug("[AddPendingModelId]", zap.Strings("modelIDS", pendingModelData.ModelIDs))
+
+		// Prepare the updated values for the transaction
+		newValues := []storage.TypedKeyValueData{
+			{
+				Key:     key,
+				Value:   pendingModelData,
+				Present: true,
+			},
+		}
+
+		return newValues, true, nil
+	}
+
+	request := storage.TypedCASRequest{
+		ConditionKeys:           []any{key},
+		RetryTillSuccessOrError: true,
+		Update:                  typedUpdateFunc,
+	}
+
+	// Execute the transaction
+	ok, err := pendingStorage.delegate.ExecuteTransaction(request)
+	if err != nil {
+		return fmt.Errorf("transaction execution failed: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("transaction was not successful")
+	}
+
+	return nil
+}
+
+func (pendingStorage *PendingModelStorage) RemovePendingModelId(key *PendingModelKey, modelId string) (err error) {
+
+	typedUpdateFunc := func(conditionValues []storage.TypedKeyValueData) (update []storage.TypedKeyValueData, ok bool, err error) {
+		if len(conditionValues) != 1 || conditionValues[0].Key != key {
+			return nil, false, fmt.Errorf("unexpected condition values or missing key")
+		}
+
+		// Fetch the current list of pending model IDs from the storage
+		currentValue, ok, err := pendingStorage.delegate.Get(key)
+		if err != nil {
+			return nil, false, err
+		}
+
+		var pendingModelData *PendingModelData
+		if currentValue == nil {
+			return
+		} else {
+			pendingModelData = currentValue.(*PendingModelData)
+		}
+
+		zap.L().Debug("[RemovePendingModelId]", zap.Strings("modelIDS", pendingModelData.ModelIDs))
+
+		pendingModelData.ModelIDs = remove(pendingModelData.ModelIDs, modelId)
+
+		zap.L().Debug("[RemovePendingModelId]", zap.Strings("after remove modelIDS", pendingModelData.ModelIDs))
 
 		// Prepare the updated values for the transaction
 		newValues := []storage.TypedKeyValueData{
